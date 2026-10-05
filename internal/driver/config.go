@@ -1,0 +1,85 @@
+package driver
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+)
+
+const (
+	DefaultDriverName             = "csi.pantechdynamics.com"
+	DefaultVersion                = "0.1.0"
+	DefaultEndpoint               = "unix:///csi/csi.sock"
+	DefaultMinimumVolumeBytes     = int64(1 << 30)
+	DefaultVolumeGranularityBytes = int64(1 << 30)
+)
+
+type Mode string
+
+const (
+	ModeController Mode = "controller"
+	ModeNode       Mode = "node"
+	ModeAll        Mode = "all"
+)
+
+type Config struct {
+	DriverName             string
+	Version                string
+	Endpoint               string
+	Mode                   Mode
+	APIURL                 string
+	APIKey                 string
+	AllowFake              bool
+	Region                 string
+	AvailabilityZone       string
+	DiskOffering           string
+	MinimumVolumeBytes     int64
+	VolumeGranularityBytes int64
+	Logger                 *slog.Logger
+}
+
+func ConfigFromEnv() Config {
+	endpoint := os.Getenv("CSI_ENDPOINT")
+	if endpoint == "" {
+		endpoint = DefaultEndpoint
+	}
+	return Config{
+		DriverName:             envString("PANTECH_DRIVER_NAME", DefaultDriverName),
+		Version:                envString("PANTECH_DRIVER_VERSION", DefaultVersion),
+		Endpoint:               endpoint,
+		Mode:                   ModeAll,
+		APIURL:                 os.Getenv("PANTECH_API_URL"),
+		APIKey:                 os.Getenv("PANTECH_API_KEY"),
+		AllowFake:              os.Getenv("PANTECH_ALLOW_FAKE") == "true",
+		Region:                 os.Getenv("PANTECH_REGION"),
+		AvailabilityZone:       os.Getenv("PANTECH_AVAILABILITY_ZONE"),
+		DiskOffering:           os.Getenv("PANTECH_DISK_OFFERING"),
+		MinimumVolumeBytes:     DefaultMinimumVolumeBytes,
+		VolumeGranularityBytes: DefaultVolumeGranularityBytes,
+		Logger:                 slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+	}
+}
+
+func (c Config) Validate() error {
+	if c.DriverName == "" {
+		return fmt.Errorf("driver name is required")
+	}
+	if c.Version == "" {
+		return fmt.Errorf("driver version is required")
+	}
+	if c.Endpoint == "" {
+		return fmt.Errorf("endpoint is required")
+	}
+	if c.Mode != ModeController && c.Mode != ModeNode && c.Mode != ModeAll {
+		return fmt.Errorf("unsupported mode %q", c.Mode)
+	}
+	return nil
+}
+
+func envString(key string, fallback string) string {
+	value := os.Getenv(key)
+	if value != "" {
+		return value
+	}
+	return fallback
+}

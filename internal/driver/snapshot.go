@@ -1,0 +1,185 @@
+package driver
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"slices"
+	"strings"
+
+	"github.com/brimble/pantech-csi/internal/cloud"
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	if req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot name is required")
+	}
+	if req.GetSourceVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "source volume id is required")
+	}
+	unlock := d.names.TryLock("snapshot:" + req.GetName())
+	if unlock == nil {
+		return nil, status.Error(codes.Aborted, "another create operation is in flight for this snapshot name")
+	}
+	defer unlock()
+	volume, err := d.cloud.GetVolumeByID(ctx, req.GetSourceVolumeId())
+	if err != nil {
+		return nil, statusError(err)
+	}
+	zone := cmp.Or(volume.AvailabilityZone, d.config.AvailabilityZone)
+	existing, err := d.reconcileSnapshotByName(ctx, req.GetName(), req.GetSourceVolumeId(), zone)
+	if err == nil {
+		return &csi.CreateSnapshotResponse{Snapshot: csiSnapshot(*existing)}, nil
+	}
+	if !errors.Is(err, cloud.ErrNotFound) {
+		return nil, grpcError(err)
+	}
+	_, err = d.cloud.CreateSnapshot(ctx, cloud.SnapshotSpec{
+		Name:             req.GetName(),
+		VolumeID:         req.GetSourceVolumeId(),
+		AvailabilityZone: zone,
+		Metadata:         map[string]string{"csi.driver": d.config.DriverName},
+	})
+	if err != nil {
+		return nil, statusError(err)
+	}
+	reconciled, err := d.reconcileCreatedSnapshot(ctx, req.GetName(), req.GetSourceVolumeId(), zone)
+	if err != nil {
+		return nil, err
+	}
+	return &csi.CreateSnapshotResponse{Snapshot: csiSnapshot(*reconciled)}, nil
+}
+
+func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
+	if req.GetSnapshotId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot id is required")
+	}
+	id, zone := decodeSnapshotID(req.GetSnapshotId(), d.config.AvailabilityZone)
+	if err := d.cloud.DeleteSnapshot(ctx, id, zone); err != nil {
+		if errors.Is(err, cloud.ErrNotFound) {
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+		return nil, statusError(err)
+	}
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+	snapshots, token, err := d.cloud.ListSnapshots(ctx, cloud.Page{Token: req.GetStartingToken(), Size: int(req.GetMaxEntries())})
+	if err != nil {
+		return nil, statusError(err)
+	}
+	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		entries = append(entries, &csi.ListSnapshotsResponse_Entry{Snapshot: csiSnapshot(snapshot)})
+	}
+	return &csi.ListSnapshotsResponse{Entries: entries, NextToken: token}, nil
+}
+
+func (d *Driver) reconcileCreatedSnapshot(ctx context.Context, name string, sourceVolumeID string, availabilityZone string) (*cloud.Snapshot, error) {
+	var previous string
+	stable := 0
+	delay := createReconcileInitialDelay
+	for range createReconcileAttempts {
+		canonical, err := d.reconcileSnapshotByName(ctx, name, sourceVolumeID, availabilityZone)
+		if err != nil {
+			if !errors.Is(err, cloud.ErrNotFound) {
+				return nil, grpcError(err)
+			}
+			if err := wait(ctx, delay); err != nil {
+				return nil, statusError(err)
+			}
+			delay *= 2
+			continue
+		}
+		if canonical.ID == previous {
+			stable++
+		} else {
+			previous = canonical.ID
+			stable = 1
+		}
+		if stable >= createReconcileStableSamples {
+			return canonical, nil
+		}
+		if err := wait(ctx, delay); err != nil {
+			return nil, statusError(err)
+		}
+		delay *= 2
+	}
+	canonical, err := d.reconcileSnapshotByName(ctx, name, sourceVolumeID, availabilityZone)
+	if err != nil {
+		if errors.Is(err, cloud.ErrNotFound) {
+			return nil, statusError(cloud.ErrUnavailable)
+		}
+		return nil, grpcError(err)
+	}
+	return canonical, nil
+}
+
+func (d *Driver) reconcileSnapshotByName(ctx context.Context, name string, sourceVolumeID string, availabilityZone string) (*cloud.Snapshot, error) {
+	snapshots, _, err := d.cloud.ListSnapshots(ctx, cloud.Page{Name: name, AvailabilityZone: availabilityZone})
+	if err != nil {
+		return nil, err
+	}
+	compatible := make([]cloud.Snapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.Name != name {
+			continue
+		}
+		if snapshot.VolumeID != sourceVolumeID {
+			return nil, status.Error(codes.AlreadyExists, "snapshot name exists for a different source volume")
+		}
+		if snapshot.AvailabilityZone == "" {
+			snapshot.AvailabilityZone = availabilityZone
+		}
+		compatible = append(compatible, snapshot)
+	}
+	if len(compatible) == 0 {
+		return nil, cloud.ErrNotFound
+	}
+	slices.SortFunc(compatible, func(left cloud.Snapshot, right cloud.Snapshot) int {
+		return cmp.Compare(left.ID, right.ID)
+	})
+	canonical := compatible[0]
+	for _, duplicate := range compatible[1:] {
+		if err := d.cloud.DeleteSnapshot(ctx, duplicate.ID, availabilityZone); err != nil && !errors.Is(err, cloud.ErrNotFound) {
+			if errors.Is(err, cloud.ErrConflict) {
+				continue
+			}
+			return nil, err
+		}
+	}
+	return &canonical, nil
+}
+
+func csiSnapshot(snapshot cloud.Snapshot) *csi.Snapshot {
+	result := &csi.Snapshot{
+		SizeBytes:      snapshot.SizeBytes,
+		SnapshotId:     encodeSnapshotID(snapshot.ID, snapshot.AvailabilityZone),
+		SourceVolumeId: snapshot.VolumeID,
+		ReadyToUse:     snapshot.Status == cloud.SnapshotStatusAvailable,
+	}
+	if !snapshot.CreatedAt.IsZero() {
+		result.CreationTime = timestamppb.New(snapshot.CreatedAt)
+	}
+	return result
+}
+
+func encodeSnapshotID(id string, availabilityZone string) string {
+	if availabilityZone == "" {
+		return id
+	}
+	return availabilityZone + "/" + id
+}
+
+func decodeSnapshotID(id string, fallbackZone string) (string, string) {
+	zone, snapshot, ok := strings.Cut(id, "/")
+	if !ok {
+		return id, fallbackZone
+	}
+	return snapshot, zone
+}

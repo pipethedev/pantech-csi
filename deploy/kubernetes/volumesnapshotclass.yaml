@@ -1,0 +1,9 @@
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: pantech
+driver: csi.pantechdynamics.com
+deletionPolicy: Delete
+parameters:
+  csi.storage.k8s.io/snapshotter-secret-name: pantech-csi
+  csi.storage.k8s.io/snapshotter-secret-namespace: kube-system

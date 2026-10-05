@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pantech-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pantech-csi-controller
+  template:
+    metadata:
+      labels:
+        app: pantech-csi-controller
+    spec:
+      serviceAccountName: pantech-csi-controller
+      containers:
+        - name: pantech-csi
+          image: ghcr.io/pipethedev/pantech-csi:latest-controller
+          args: ["-mode=controller"]
+          envFrom:
+            - secretRef:
+                name: pantech-csi
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.1
+          args: ["--csi-address=/csi/csi.sock"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.6.1
+          args: ["--csi-address=/csi/csi.sock"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.11.1
+          args: ["--csi-address=/csi/csi.sock"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.0.1
+          args: ["--csi-address=/csi/csi.sock"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+      volumes:
+        - name: socket
+          emptyDir: {}

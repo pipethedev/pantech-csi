@@ -1,0 +1,15 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pantech
+provisioner: csi.pantechdynamics.com
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  availability_zone: replace-me
+  disk_offering_slug: replace-me
+  region: replace-me
+  csi.storage.k8s.io/provisioner-secret-name: pantech-csi
+  csi.storage.k8s.io/provisioner-secret-namespace: kube-system
+  csi.storage.k8s.io/controller-publish-secret-name: pantech-csi
+  csi.storage.k8s.io/controller-publish-secret-namespace: kube-system

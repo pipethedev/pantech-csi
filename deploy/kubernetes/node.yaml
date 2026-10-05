@@ -1,0 +1,81 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.pantechdynamics.com
+spec:
+  attachRequired: true
+  podInfoOnMount: false
+  fsGroupPolicy: None
+  storageCapacity: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pantech-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: pantech-csi-node
+  template:
+    metadata:
+      labels:
+        app: pantech-csi-node
+    spec:
+      serviceAccountName: pantech-csi-node
+      containers:
+        - name: pantech-csi
+          image: ghcr.io/pipethedev/pantech-csi:latest-node
+          securityContext:
+            privileged: true
+          args: ["-mode=node"]
+          envFrom:
+            - secretRef:
+                name: pantech-csi
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+            - name: udev
+              mountPath: /run/udev
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.11.1
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/csi.pantechdynamics.com/csi.sock"
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.pantechdynamics.com
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: pods-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: udev
+          hostPath:
+            path: /run/udev
+            type: Directory

@@ -1,0 +1,214 @@
+//go:build linux
+
+package mount
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/brimble/pantech-csi/internal/cloud"
+	"golang.org/x/sys/unix"
+	kmount "k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
+)
+
+const (
+	deviceWaitInterval = 500 * time.Millisecond
+	deviceWaitTimeout  = 2 * time.Minute
+)
+
+type Linux struct {
+	mounter *kmount.SafeFormatAndMount
+	exec    utilexec.Interface
+}
+
+func newLinux() *Linux {
+	exec := utilexec.New()
+	return &Linux{
+		mounter: &kmount.SafeFormatAndMount{
+			Interface: kmount.New(""),
+			Exec:      exec,
+		},
+		exec: exec,
+	}
+}
+
+func (l *Linux) IsMounted(ctx context.Context, target string) (bool, error) {
+	notMount, err := l.mounter.IsLikelyNotMountPoint(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect mount %s: %w", target, err)
+	}
+	return !notMount, nil
+}
+
+func (l *Linux) Stage(ctx context.Context, source string, target string, fsType string, flags []string) error {
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		return fmt.Errorf("create staging path %s: %w", target, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := l.mounter.FormatAndMountSensitive(source, target, fsType, flags, nil); err != nil {
+		return fmt.Errorf("stage device %s at %s: %w", source, target, err)
+	}
+	return nil
+}
+
+func (l *Linux) Publish(ctx context.Context, source string, target string, readonly bool, block bool, flags []string) error {
+	if block {
+		if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+			return fmt.Errorf("create block target parent %s: %w", target, err)
+		}
+		file, err := os.OpenFile(target, os.O_CREATE, 0o600)
+		if err != nil {
+			return fmt.Errorf("create block target %s: %w", target, err)
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("close block target %s: %w", target, err)
+		}
+	} else if err := os.MkdirAll(target, 0o750); err != nil {
+		return fmt.Errorf("create publish path %s: %w", target, err)
+	}
+	options := append([]string{"bind"}, flags...)
+	if readonly {
+		options = append(options, "ro")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := l.mounter.MountSensitive(source, target, "", options, nil); err != nil {
+		return fmt.Errorf("publish %s at %s: %w", source, target, err)
+	}
+	return nil
+}
+
+func (l *Linux) Unmount(ctx context.Context, target string) error {
+	mounted, err := l.IsMounted(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := l.mounter.Unmount(target); err != nil {
+		return fmt.Errorf("unmount %s: %w", target, err)
+	}
+	return nil
+}
+
+func (l *Linux) Stats(_ context.Context, target string, block bool) (Stats, error) {
+	info, err := os.Stat(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Stats{}, fmt.Errorf("volume path %s: %w", target, os.ErrNotExist)
+		}
+		return Stats{}, fmt.Errorf("stat volume path %s: %w", target, err)
+	}
+	if block {
+		return Stats{TotalBytes: info.Size()}, nil
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(target, &stat); err != nil {
+		return Stats{}, fmt.Errorf("statfs %s: %w", target, err)
+	}
+	total := int64(stat.Blocks) * int64(stat.Bsize)
+	free := int64(stat.Bavail) * int64(stat.Bsize)
+	files := int64(stat.Files)
+	freeFiles := int64(stat.Ffree)
+	return Stats{
+		TotalBytes:     total,
+		AvailableBytes: free,
+		UsedBytes:      total - free,
+		TotalInodes:    files,
+		FreeInodes:     freeFiles,
+		UsedInodes:     files - freeFiles,
+	}, nil
+}
+
+func (l *Linux) IsBlock(_ context.Context, target string) (bool, error) {
+	info, err := os.Stat(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, fmt.Errorf("volume path %s: %w", target, os.ErrNotExist)
+		}
+		return false, fmt.Errorf("stat volume path %s: %w", target, err)
+	}
+	return info.Mode()&os.ModeDevice != 0, nil
+}
+
+func (l *Linux) Expand(ctx context.Context, target string, fsType string) error {
+	actual, err := l.filesystemType(ctx, target)
+	if err != nil {
+		return err
+	}
+	selected := fsType
+	if actual != "" {
+		selected = actual
+	}
+	switch selected {
+	case "ext4", "ext3", "ext2":
+		return l.run(ctx, "resize2fs", target)
+	case "xfs":
+		return l.run(ctx, "xfs_growfs", target)
+	default:
+		return fmt.Errorf("unsupported filesystem %q", selected)
+	}
+}
+
+func (l *Linux) filesystemType(ctx context.Context, target string) (string, error) {
+	cmd := l.exec.CommandContext(ctx, "findmnt", "-n", "-o", "FSTYPE", "--target", target)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("detect filesystem for %s: %w: %s", target, err, string(output))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func (l *Linux) FindDevice(ctx context.Context, volumeID string, hintedPath string) (string, error) {
+	// Pantech does not return a guest device path. Attached disks show up under these QEMU by-id names.
+	candidates := deviceCandidates(volumeID, hintedPath)
+	deadline := time.NewTimer(deviceWaitTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(deviceWaitInterval)
+	defer ticker.Stop()
+	for {
+		for _, candidate := range candidates {
+			if candidate == "" {
+				continue
+			}
+			resolved, err := filepath.EvalSymlinks(candidate)
+			if err == nil {
+				return resolved, nil
+			}
+			if !os.IsNotExist(err) {
+				return "", fmt.Errorf("resolve device %s: %w", candidate, err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("wait for device %s: %w", volumeID, cloud.ErrUnavailable)
+		case <-deadline.C:
+			return "", fmt.Errorf("wait for device %s: %w", volumeID, cloud.ErrUnavailable)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (l *Linux) run(ctx context.Context, command string, args ...string) error {
+	cmd := l.exec.CommandContext(ctx, command, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("run %s: %w: %s", command, err, string(output))
+	}
+	return nil
+}

@@ -1,0 +1,31 @@
+{{- if .Values.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    {{- include "pantech-csi.labels" . | nindent 4 }}
+  {{- with .Values.storageClass.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+provisioner: {{ .Values.driver.name }}
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+parameters:
+  availability_zone: {{ required "pantech.availabilityZone is required" .Values.pantech.availabilityZone | quote }}
+  disk_offering_slug: {{ required "pantech.diskOffering is required" .Values.pantech.diskOffering | quote }}
+  {{- if .Values.pantech.region }}
+  region: {{ .Values.pantech.region | quote }}
+  {{- end }}
+  csi.storage.k8s.io/provisioner-secret-name: {{ include "pantech-csi.secretName" . | quote }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ include "pantech-csi.namespace" . | quote }}
+  csi.storage.k8s.io/controller-publish-secret-name: {{ include "pantech-csi.secretName" . | quote }}
+  csi.storage.k8s.io/controller-publish-secret-namespace: {{ include "pantech-csi.namespace" . | quote }}
+  csi.storage.k8s.io/controller-expand-secret-name: {{ include "pantech-csi.secretName" . | quote }}
+  csi.storage.k8s.io/controller-expand-secret-namespace: {{ include "pantech-csi.namespace" . | quote }}
+  {{- with .Values.storageClass.parameters }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}
