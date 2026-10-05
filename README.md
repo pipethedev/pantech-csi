@@ -136,10 +136,14 @@ Writes return `202` with an `operation_id`. The client sends a new `Idempotency-
 
 Creating a volume calls `POST /volumes`. Creating one from a snapshot calls `POST /snapshots/{snapshot_id}/restore`. Snapshots of a volume call `POST /volumes/{volume_id}/snapshots`. Snapshot delete is `DELETE /snapshots/{snapshot_id}` and does not need a zone. When a zone is known, CSI snapshot IDs are still `zone/snapshot-id` so a later delete can recover the provider id.
 
-Pantech volumes attach to one instance and do not return a guest device path. Publish context uses `/dev/disk/by-id/virtio-<volume id>`. The node plugin also tries the QEMU SCSI by-id name.
+Pantech volumes attach to one instance and do not return a guest device path. Publish context uses `/dev/disk/by-id/virtio-<volume id>`. The node plugin also tries the QEMU SCSI by-id name. Unpublish calls detach when `attached_instance_id` or `desired_instance_id` is that instance, so a failed attach can still be cleared before delete.
 
 The public API does not offer conditional create by name. After create, the driver re-lists the name, waits until the lowest compatible id stays stable, and deletes visible unattached duplicates when that is safe. This is best-effort reconciliation.
 
 ## Node identity
 
 The public API has no “current instance” endpoint. The node plugin reads cloud-init instance data from `/run/cloud-init/instance-data.json` or `/var/lib/cloud/instance/instance-data.json`. If neither file has an instance ID, `NodeGetInfo` fails.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

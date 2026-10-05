@@ -364,6 +364,32 @@ func TestClient_DetachVolume_UsesDetachPath(t *testing.T) {
 	}
 }
 
+func TestClient_DetachVolume_ClearsDesiredInstance(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/public/v1/volumes/vol_1":
+			return jsonResponse(t, http.StatusOK, apiVolume{
+				ID:              "vol_1",
+				Zone:            strPtr("zone-a"),
+				DesiredInstance: strPtr("inst_1"),
+				DesiredState:    "present",
+				ObservedState:   "active",
+			}), nil
+		case "/public/v1/volumes/vol_1/detach":
+			return jsonResponse(t, http.StatusAccepted, acceptedResponse{OperationID: "op_1", ResourceID: "vol_1"}), nil
+		case "/public/v1/operations/op_1":
+			return jsonResponse(t, http.StatusOK, apiOperation{ID: "op_1", Status: "succeeded"}), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			return nil, nil
+		}
+	})
+	client := newTestClient(t, transport)
+	if err := client.DetachVolume(context.Background(), "vol_1", "inst_1", "zone-a"); err != nil {
+		t.Fatalf("detach volume: %v", err)
+	}
+}
+
 func TestClient_ResizeVolume_UsesCurrentOffering(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch {

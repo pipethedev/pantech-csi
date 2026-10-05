@@ -239,27 +239,21 @@ func (c *Client) waitAttached(ctx context.Context, volumeID string, instanceID s
 }
 
 func (c *Client) DetachVolume(ctx context.Context, volumeID, instanceID string, availabilityZone string) error {
-	volume, err := c.GetVolumeByID(ctx, volumeID)
-	if err != nil {
+	var payload apiVolume
+	if err := c.do(ctx, http.MethodGet, "/volumes/"+url.PathEscape(volumeID), nil, nil, "", decodeJSON(&payload)); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil
 		}
 		return err
 	}
+	volume := payload.toDomain(c.config.AvailabilityZone)
 	if availabilityZone != "" && volume.AvailabilityZone != "" && volume.AvailabilityZone != availabilityZone {
 		return nil
 	}
-	attached := false
-	for _, attachment := range volume.Attachments {
-		if attachment.InstanceID == instanceID {
-			attached = true
-			break
-		}
-	}
-	if !attached {
+	if deref(payload.AttachedInstance) != instanceID && deref(payload.DesiredInstance) != instanceID {
 		return nil
 	}
-	_, err = c.write(ctx, http.MethodPost, "/volumes/"+url.PathEscape(volumeID)+"/detach", nil)
+	_, err := c.write(ctx, http.MethodPost, "/volumes/"+url.PathEscape(volumeID)+"/detach", nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -773,6 +767,7 @@ type apiVolume struct {
 	Region           *string `json:"region"`
 	Zone             *string `json:"zone"`
 	AttachedInstance *string `json:"attached_instance_id"`
+	DesiredInstance  *string `json:"desired_instance_id"`
 	DesiredState     string  `json:"desired_state"`
 	ObservedState    string  `json:"observed_state"`
 }
